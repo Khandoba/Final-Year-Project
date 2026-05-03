@@ -37,14 +37,17 @@ env.bak/
 venv.bak/
 
 # dataset and model checkpoints
-models/*.pt
-models/*.pth
-models/*.h5
+**/*.pt
+**/*.pth
+**/*.h5
 
 # specific to lie detector
 lie_detector/temp_capture/
 lie_detector/openface_output/
+openface_output/
 lie_detector/data/
+OpenFace.zip
+lie_detector/agents/OpenFace/
 MU3D-Package/data/
 MU3D-Package/Videos/
 MU3D-Package/Audio/

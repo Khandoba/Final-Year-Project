@@ -1,3 +1,6 @@
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="google.protobuf")
+warnings.filterwarnings("ignore", message="SymbolDatabase.GetPrototype")
 import argparse
 import cv2
 import time
@@ -10,13 +13,42 @@ import speech_recognition as sr
 import math
 from agents.lie_detect_agent import LieDetectAgent
 
+try:
+    import mediapipe as mp
+    mp_face_mesh = mp.solutions.face_mesh
+    mp_drawing = mp.solutions.drawing_utils
+    mp_drawing_styles = mp.solutions.drawing_styles
+    MEDIAPIPE_AVAILABLE = True
+except (ImportError, AttributeError):
+    print("Warning: mediapipe not available. Landmark visualization disabled.")
+    MEDIAPIPE_AVAILABLE = False
+
+# MediaPipe landmark indices for each tracked AU region
+# Based on the 468-point Face Mesh topology
+AU_LANDMARK_REGIONS = {
+    "AU04 Brow Lowerer":  [9, 55, 107, 66, 105, 63, 70, 285, 336, 296, 334, 293],   # inner brows
+    "AU12 Lip Corner":    [61, 291, 185, 40, 39, 37, 267, 269, 270, 409],             # lip corners
+    "AU15 Lip Depress":   [17, 314, 405, 321, 375, 291, 61, 146, 91, 181, 84, 17],   # lower lip
+    "AU20 Lip Stretch":   [61, 291, 306, 292, 407, 320, 76, 77, 90, 180, 85, 16],    # outer lip
+    "AU45 Blink":         [159, 145, 33, 133, 386, 374, 362, 263],                    # both eyes
+}
+
 # Global constants for real-time capture
 CHUNK_DURATION = 5 # Process 5 seconds of data at a time
 TEMP_DIR = os.path.join(os.getcwd(), "temp_capture")
 FPS = 20.0 # Approximate framerate
 
-# We need a quick face detector for drawing bounding boxes on the live feed
+# Face cascade for fallback bounding box when MediaPipe is unavailable
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+# Color palette for AU regions
+AU_COLORS = [
+    (255, 100, 100),   # AU04 - blue
+    (100, 255, 100),   # AU12 - green
+    (100, 100, 255),   # AU15 - red
+    (255, 255, 100),   # AU20 - cyan
+    (255, 100, 255),   # AU45 - magenta
+]
 
 os.makedirs(TEMP_DIR, exist_ok=True)
 
@@ -75,19 +107,31 @@ class RealtimePipeline:
 
     def transcribe_audio(self, audio_path):
         """Transcribes audio using SpeechRecognition."""
+        if not os.path.exists(audio_path):
+            print("[Audio] No audio file found - microphone may not be recording.")
+            return ""
+        
+        file_size = os.path.getsize(audio_path)
+        if file_size < 5000:
+            print(f"[Audio] Audio file too small ({file_size} bytes) - mic may be off or silent.")
+            return ""
+        
         recognizer = sr.Recognizer()
         try:
             with sr.AudioFile(audio_path) as source:
                 audio_data = recognizer.record(source)
                 text = recognizer.recognize_google(audio_data)
+                print(f"[Audio] Transcript: '{text}'")
                 return text
         except sr.UnknownValueError:
-            return "" # Could not understand audio
+            print("[Audio] Could not understand speech (try speaking louder/clearer).")
+            return ""
         except sr.RequestError as e:
-            print(f"Could not request results; {e}")
+            print(f"[Audio] Google API error (check internet): {e}")
             return ""
         except Exception as e:
-             return ""
+            print(f"[Audio] Transcription error: {e}")
+            return ""
 
     def process_chunk(self, video_path, audio_path):
         """Runs the agent on the captured chunks in a background thread."""
@@ -101,10 +145,12 @@ class RealtimePipeline:
         
         with self.lock:
              self.latest_decision = result['decision']
-             self.latest_prob = result.get('fused_probability', 0.5)
+             self.latest_prob = result['deception_prob']
              
         dt = time.time() - start_t
-        print(f"\n[{chunk_name} Finished in {dt:.1f}s] Result: {self.latest_decision}")
+        v_score = result['scores'].get('vision', 0.5)
+        a_score = result['scores'].get('audio', 0.5)
+        print(f"\n[{chunk_name} Finished in {dt:.1f}s] Result: {self.latest_decision} (Vision: {v_score*100:.1f}%, Audio: {a_score*100:.1f}%)")
 
     def run(self):
          print("Starting live continuous capture. Press 'q' in the video window to quit.")
@@ -114,6 +160,16 @@ class RealtimePipeline:
          if not cap.isOpened():
              print("Error: Could not open webcam.")
              return
+         
+         # Initialize MediaPipe Face Mesh (persistent across frames for performance)
+         face_mesh_detector = None
+         if MEDIAPIPE_AVAILABLE:
+             face_mesh_detector = mp_face_mesh.FaceMesh(
+                 max_num_faces=1,
+                 refine_landmarks=True,
+                 min_detection_confidence=0.5,
+                 min_tracking_confidence=0.5
+             )
              
          chunk_index = 0
          last_process_time = time.time()
@@ -155,29 +211,72 @@ class RealtimePipeline:
                  # 2. Add to current video chunk
                  current_out.write(frame)
                  
-                 # 3. Draw bounding box and live stats on display frame
-                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                 faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+                 # 3. Draw face mesh and AU landmarks on display frame
+                 display_frame = frame.copy()
+                 h_frame, w_frame = display_frame.shape[:2]
                  
+                 if MEDIAPIPE_AVAILABLE:
+                     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                     results = face_mesh_detector.process(rgb_frame)
+                     if results.multi_face_landmarks:
+                         for face_landmarks in results.multi_face_landmarks:
+                             # Draw subtle full face mesh
+                             mp_drawing.draw_landmarks(
+                                 image=display_frame,
+                                 landmark_list=face_landmarks,
+                                 connections=mp_face_mesh.FACEMESH_TESSELATION,
+                                 landmark_drawing_spec=None,
+                                 connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_tesselation_style()
+                             )
+                             # Highlight tracked AU regions with colored dots
+                             lm = face_landmarks.landmark
+                             for idx, (au_name, indices) in enumerate(AU_LANDMARK_REGIONS.items()):
+                                 color = AU_COLORS[idx % len(AU_COLORS)]
+                                 for li in indices:
+                                     x_px = int(lm[li].x * w_frame)
+                                     y_px = int(lm[li].y * h_frame)
+                                     cv2.circle(display_frame, (x_px, y_px), 4, color, -1)
+                             
+                             # Draw AU legend in top-right corner
+                             legend_x = w_frame - 220
+                             legend_y = 20
+                             cv2.rectangle(display_frame, (legend_x - 5, legend_y - 5),
+                                         (w_frame - 5, legend_y + len(AU_LANDMARK_REGIONS) * 22 + 5),
+                                         (30, 30, 30), -1)
+                             for idx, au_name in enumerate(AU_LANDMARK_REGIONS.keys()):
+                                 color = AU_COLORS[idx % len(AU_COLORS)]
+                                 cv2.circle(display_frame, (legend_x + 8, legend_y + idx * 22 + 8), 6, color, -1)
+                                 cv2.putText(display_frame, au_name, (legend_x + 20, legend_y + idx * 22 + 13),
+                                             cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1)
+                 else:
+                     # Fallback: simple bounding box
+                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                     faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+                     for (x, y, w_box, h_box) in faces:
+                         cv2.rectangle(display_frame, (x, y), (x+w_box, y+h_box), (255, 255, 255), 2)
+
+                 # Draw probability bar and decision label at the bottom
                  with self.lock:
                       dec = self.latest_decision
                       prob = self.latest_prob
-                      
-                 # Determine color based on probability
-                 # Green for Truth (low prob), Red for Lie (high prob)
+
                  if prob is None or math.isnan(prob):
-                     color = (255, 255, 255)
+                     color = (200, 200, 200)
                      prob_disp = 0.5
                  else:
                      color = (0, int(255*(1-prob)), int(255*prob))
                      prob_disp = prob
-                 
-                 for (x, y, w_box, h_box) in faces:
-                     cv2.rectangle(frame, (x, y), (x+w_box, y+h_box), color, 2)
-                     text_label = f"{dec}: {prob_disp*100:.1f}%"
-                     cv2.putText(frame, text_label, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-                     
-                 cv2.imshow('Multi-Modal Lie Detector', frame)
+
+                 # Bottom status bar
+                 bar_h = 50
+                 cv2.rectangle(display_frame, (0, h_frame - bar_h), (w_frame, h_frame), (30, 30, 30), -1)
+                 bar_fill = int(w_frame * prob_disp)
+                 cv2.rectangle(display_frame, (0, h_frame - bar_h), (bar_fill, h_frame), color, -1)
+                 label = f"{dec}  |  Deception: {prob_disp*100:.1f}%"
+                 cv2.putText(display_frame, label, (10, h_frame - 15),
+                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+                 cv2.imshow('Multi-Modal Lie Detector', display_frame)
                  
                  # 4. Check if it's time to process a chunk
                  if time.time() - last_process_time >= CHUNK_DURATION:
@@ -230,8 +329,11 @@ class RealtimePipeline:
 
 def main():
     parser = argparse.ArgumentParser(description="Multi-modal Lie Detection System")
-    parser.add_argument("--openface-path", type=str, default="FeatureExtraction.exe",
-                        help="Path to OpenFace FeatureExtraction executable")
+   
+    parser.add_argument("--openface-path", type=str, 
+                    default=r"C:\Users\ayush\.gemini\antigravity\scratch\Final-Year-Project\lie_detector\agents\OpenFace\OpenFace_2.2.0_win_x64\FeatureExtraction.exe",
+                    help="Path to OpenFace FeatureExtraction executable")
+                        
     args = parser.parse_args()
 
     agent = LieDetectAgent(openface_path=args.openface_path)

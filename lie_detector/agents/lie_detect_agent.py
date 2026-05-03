@@ -11,12 +11,22 @@ class LieDetectAgent:
         Initializes the Agent responsible for analyzing modalities and performing ReAct reasoning.
         """
         self.vision_model = VisionModel(openface_path=openface_path)
+        v_path = os.path.join(os.path.dirname(__file__), '..', 'models', 'vision_model.pth')
+        if os.path.exists(v_path):
+            self.vision_model.load_state_dict(torch.load(v_path, weights_only=True))
+            self.vision_model.eval()
+
         self.audio_model = AudioModel()
+        a_path = os.path.join(os.path.dirname(__file__), '..', 'models', 'audio_model.pth')
+        if os.path.exists(a_path):
+            self.audio_model.load_state_dict(torch.load(a_path, weights_only=True))
+            self.audio_model.eval()
+            
         self.text_model = TextModel()
         
         self.fusion_model = FusionModel()
-        model_path = os.path.join(os.path.dirname(__file__), '..', 'models', 'best_fusion_model.pth')
-        self.fusion_model.load_weights(model_path)
+        f_path = os.path.join(os.path.dirname(__file__), '..', 'models', 'fusion_model.pth')
+        self.fusion_model.load_weights(f_path)
         
         self.thoughts = []
 
@@ -50,7 +60,7 @@ class LieDetectAgent:
         if audio_file is not None:
             audio_prob = self.audio_model.predict_deception(audio_file)
             scores['audio'] = audio_prob
-            self.thoughts.append(f"Audio analysis (openSMILE eGeMAPS): model returned probability {audio_prob:.2f} for deception.")
+            self.thoughts.append(f"Audio analysis (librosa MFCCs): model returned probability {audio_prob:.2f} for deception.")
             
             if audio_prob > 0.7:
                 self.thoughts.append("Thought: Acoustic features (pitch, voice quality) indicate high stress.")
@@ -71,40 +81,56 @@ class LieDetectAgent:
         if not scores:
             return {"decision": "No data", "confidence": 0.0, "explanation": "No valid modalities could be analyzed."}
 
-        # 4. Neural Fusion Reasoning
+        # 4. Rule-Based Fusion Reasoning
         vision_val = scores.get('vision', 0.5)
         audio_val = scores.get('audio', 0.5)
-        text_val = scores.get('text', 0.5)
         
-        feats = torch.tensor([[vision_val, audio_val, text_val]], dtype=torch.float32)
-        with torch.no_grad():
-            output = self.fusion_model(feats)
-            avg_score = torch.sigmoid(output).item()
-            
-        self.thoughts.append(f"Trained Fusion probability = {avg_score:.2f}.")
+        # Get individual decisions based on a 0.5 threshold
+        vision_is_deceptive = vision_val >= 0.5
+        audio_is_deceptive = audio_val >= 0.5
 
-        if avg_score >= 0.5:
+        # Check for agreement or conflict
+        if vision_is_deceptive and audio_is_deceptive:
             decision = "Deceptive"
-            conf = avg_score
-        else:
+            conf = max(vision_val, audio_val)
+            self.thoughts.append("Action: Both modalities agree. Decision = Deceptive.")
+        elif not vision_is_deceptive and not audio_is_deceptive:
             decision = "Truthful"
-            conf = 1 - avg_score
+            conf = 1 - min(vision_val, audio_val)
+            self.thoughts.append("Action: Both modalities agree. Decision = Truthful.")
+        else:
+            # They disagree!
+            decision = "Conflicting"
+            # In a conflict, the confidence is low
+            conf = 0.5
+            
+            # Explain the conflict in the thoughts
+            if vision_is_deceptive:
+                self.thoughts.append("Thought: Modalities disagree! Vision detects deception, but Audio seems truthful.")
+            else:
+                self.thoughts.append("Thought: Modalities disagree! Audio detects stress/deception, but Vision seems relaxed.")
+                
+            # "Aggressive Deception" override rule:
+            # If one model is EXTREMELY confident about deception (>0.75), override the conflict
+            if vision_val > 0.75 or audio_val > 0.75:
+                decision = "Deceptive (High Alert)"
+                conf = max(vision_val, audio_val)
+                self.thoughts.append("Action: One modality is extremely confident about deception. Overriding conflict to flag as Deceptive.")
 
-        self.thoughts.append(f"Action: Based on combined analysis, decision = {decision}.")
-
-        # Handling conflicting signals
-        if 0.4 < avg_score < 0.6 and len(scores) > 1:
-            spread = max(scores.values()) - min(scores.values())
-            if spread > 0.5:
-                self.thoughts.append("Thought: Modalities disagree significantly (e.g., relaxed face but stressed voice). Flagging for human review.")
-                decision += " (Ambiguous/Conflicting)"
+        # Determine aggregate deception score for the UI bar
+        # Averaging them gives a smooth, realistic bar (e.g., 30% or 40% deception)
+        deception_prob = (vision_val + audio_val) / 2.0
+        
+        # If the Aggressive Override triggered, ensure the bar reflects the high deception
+        if decision.startswith("Deceptive") and deception_prob < 0.5:
+            deception_prob = max(vision_val, audio_val)
 
         explanation = "\n".join(self.thoughts)
         
         return {
             "decision": decision, 
             "confidence": float(conf), 
+            "deception_prob": float(deception_prob),
             "explanation": explanation, 
-            "scores": scores,
-            "fused_probability": avg_score # The raw 0-1 probability
+            "scores": scores
         }
